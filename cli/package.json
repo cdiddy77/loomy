@@ -1,0 +1,14 @@
+{
+  "name": "loomy-cli",
+  "private": true,
+  "type": "module",
+  "bin": { "loomy": "dist/index.js" },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "^7.0.2"
+  }
+}

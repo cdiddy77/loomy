@@ -23,3 +23,16 @@ coverage/
 .idea/
 .vscode/*
 !.vscode/extensions.json
+
+# Cloudflare
+.wrangler/
+.dev.vars
+worker-configuration.d.ts
+# The real Worker configuration has the database ID. See wrangler.example.jsonc.
+worker/wrangler.jsonc
+
+# Test output
+.e2e/
+
+# Browser test output
+.playwright-mcp/

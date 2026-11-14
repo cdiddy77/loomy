@@ -1,0 +1,22 @@
+// Copy this file to wrangler.jsonc, which git ignores.
+// Then put the ID that `wrangler d1 create loomy` prints into database_id.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "loomy",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "loomy-videos" }],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "loomy",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  // The eviction job runs one time each day, at 09:17 UTC.
+  "triggers": { "crons": ["17 9 * * *"] },
+  "vars": { "STORAGE_BUDGET_BYTES": "8000000000" },
+  "observability": { "enabled": true }
+}

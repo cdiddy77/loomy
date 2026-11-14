@@ -1,15 +1,13 @@
 # Loomy
 
-Loomy is a service that records a screen and a camera, then shares the video with a link.
+Loomy lets one person record video on one Mac and share each video with a link.
 
-## Planned features
+## Documentation
 
-- Record the screen, the camera, and the microphone in the browser.
-- Upload the recording to the server.
-- Share the recording with a link.
-- Play the recording on a watch page.
-- Show a library of recordings for each user.
+All documentation is in Notion: <https://app.notion.com/p/Loomy-418c224faa6e80af80e1df5cb39e137d>
 
 ## Status
 
-The repository is new. It contains no application code.
+The watch service (`worker/`) and the publish tool (`cli/`) pass a local test. The Worker is deployed.
+
+Run `pnpm install`, then `pnpm e2e`, to do the local test.
