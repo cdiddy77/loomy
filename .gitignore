@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+.next/
+out/
+coverage/
+
+# Logs
+*.log
+
+# Editors
+.idea/
+.vscode/*
+!.vscode/extensions.json
