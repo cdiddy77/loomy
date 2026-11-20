@@ -10,6 +10,7 @@ export LOOMY_URL="http://127.0.0.1:$PORT"
 export LOOMY_ADMIN_TOKEN="e2e-token-0123456789abcdef0123456789abcdef"
 export LOOMY_DATA_DIR="$WORK/data"
 export LOOMY_NO_CLIPBOARD=1
+export LOOMY_ARCHIVE="$WORK/archive"
 LOOMY="node $ROOT/cli/dist/index.js"
 SERVER_PID=""
 
@@ -39,7 +40,7 @@ start_server() { # $1 = storage budget in bytes
 
 status() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
 
-rm -rf "$WORK" && mkdir -p "$WORK"
+rm -rf "$WORK" && mkdir -p "$WORK/archive"
 # The local test does not use the database ID, so the example configuration is sufficient.
 [ -f "$ROOT/worker/wrangler.jsonc" ] || cp "$ROOT/worker/wrangler.example.jsonc" "$ROOT/worker/wrangler.jsonc"
 (cd "$ROOT" && pnpm -s build)
@@ -131,6 +132,39 @@ pass "the eviction job removes the least recently viewed video"
 [ "$($LOOMY publish "$ID_A")" = "$URL_A" ] || fail "publish again changed the link of video A"
 [ "$(status "$URL_A")" = "200" ] || fail "video A is not available after publish again"
 pass "an evicted video comes back with the same link"
+
+# --- Archive -----------------------------------------------------------------
+for f in meta.json video.mp4 thumb.jpg original.mov; do
+  [ -f "$LOOMY_ARCHIVE/$ID_A/$f" ] || fail "the archive of video A has no $f"
+done
+cmp -s "$LOOMY_ARCHIVE/$ID_A/original.mov" "$WORK/small.mov" || fail "the archived original is different"
+pass "publish copies the video and the original to the archive"
+
+[ -f "$LOOMY_ARCHIVE/$ID_B/captions.vtt" ] || fail "publish again did not copy the captions to the archive"
+pass "publish again updates the archive"
+
+rm -rf "$LOOMY_DATA_DIR/$ID_A"
+$LOOMY rm "$ID_A" 2>/dev/null
+[ "$(status "$URL_A")" = "410" ] || fail "rm did not remove video A"
+[ "$($LOOMY publish "$ID_A")" = "$URL_A" ] || fail "publish from the archive changed the link"
+curl -s -o "$WORK/a2.mp4" "$URL_A/video.mp4"
+cmp -s "$WORK/a2.mp4" "$WORK/a.mp4" || fail "the video from the archive is different"
+[ ! -e "$LOOMY_DATA_DIR/$ID_A/original.mov" ] || fail "restore must not copy the original"
+pass "publish gets a video from the archive when no local copy exists"
+
+set +e
+LOOMY_ARCHIVE="$WORK/small.mov/x" $LOOMY publish "$ID_A" >"$WORK/out.txt" 2>/dev/null
+CODE=$?
+set -e
+[ "$CODE" = "2" ] || fail "a failed archive copy must give exit code 2, not $CODE"
+[ "$(cat "$WORK/out.txt")" = "$URL_A" ] || fail "a failed archive copy must not stop the publish"
+pass "a failed archive copy gives a warning and exit code 2"
+
+# --- Time of creation --------------------------------------------------------
+curl -s -o /dev/null -X PUT -H "Authorization: Bearer $LOOMY_ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  --data '{"title":"Old","durationS":1,"createdAt":1500000000000}' "$LOOMY_URL/admin/videos/BBBBBBBBBBBBBBBBBBBBBB"
+$LOOMY list --json | grep -q '"created_at": 1500000000000' || fail "the Worker did not keep the supplied time of creation"
+pass "the publish tool can supply the time of creation"
 
 # --- Remove ------------------------------------------------------------------
 $LOOMY rm "$ID_B" 2>/dev/null

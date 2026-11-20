@@ -238,20 +238,24 @@ async function adminRoute(request: Request, env: Env, url: URL, parts: string[])
 }
 
 async function upsertVideo(request: Request, env: Env, id: string): Promise<Response> {
-  const body = (await request.json()) as { title?: unknown; durationS?: unknown };
+  const body = (await request.json()) as { title?: unknown; durationS?: unknown; createdAt?: unknown };
   const title = typeof body.title === "string" ? body.title.trim().slice(0, 200) : "";
   const duration = typeof body.durationS === "number" && Number.isFinite(body.durationS) ? body.durationS : 0;
   if (!title) return text("Missing title", 400);
   const now = Date.now();
-  // A video that is published again keeps its time of creation. Its time of
-  // last view starts again, so the eviction job does not remove it immediately.
+  // The publish tool can supply the time of creation, for example for an imported video.
+  const given = typeof body.createdAt === "number" && body.createdAt > 0 && body.createdAt <= now ? body.createdAt : null;
+  // A video that is published again keeps its time of creation, unless the tool
+  // supplies one. Its time of last view starts again, so the eviction job does
+  // not remove it immediately.
   await env.DB.prepare(
     `INSERT INTO videos (id, title, duration_s, state, created_at, updated_at, last_viewed_at)
-     VALUES (?1, ?2, ?3, 'uploading', ?4, ?4, ?4)
+     VALUES (?1, ?2, ?3, 'uploading', COALESCE(?5, ?4), ?4, ?4)
      ON CONFLICT (id) DO UPDATE SET
-       title = ?2, duration_s = ?3, state = 'uploading', updated_at = ?4, last_viewed_at = ?4`,
+       title = ?2, duration_s = ?3, state = 'uploading', updated_at = ?4, last_viewed_at = ?4,
+       created_at = COALESCE(?5, created_at)`,
   )
-    .bind(id, title, duration, now)
+    .bind(id, title, duration, now, given)
     .run();
   return json({ ok: true });
 }

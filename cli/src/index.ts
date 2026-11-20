@@ -2,8 +2,8 @@
 import { execFile, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, open, readFile, stat, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { mkdir, mkdtemp, open, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { basename, extname, join, resolve } from "node:path";
 import { parseArgs, promisify } from "node:util";
 
@@ -12,10 +12,13 @@ const run = promisify(execFile);
 const ID_RE = /^[A-Za-z0-9_-]{22}$/;
 // R2 needs parts of equal size. A Worker on the free plan accepts a body of 100 MB maximum.
 const PART_BYTES = 32 * 1024 * 1024;
+const LOOM_RE = /^https:\/\/www\.loom\.com\/share\/[0-9a-f]{32}(\?.*)?$/;
 
 interface Config {
   url: string;
   adminToken: string;
+  // The rsync destination of the archive: "user@host:directory" or a local directory.
+  archive?: string;
 }
 
 interface Meta {
@@ -24,6 +27,14 @@ interface Meta {
   source: string;
   durationS: number;
   createdAt: string;
+  // The link of the video in a different service, for an imported video.
+  importedFrom?: string;
+}
+
+interface PublishOptions {
+  title?: string;
+  createdAt?: string;
+  importedFrom?: string;
 }
 
 interface VideoRow {
@@ -39,13 +50,16 @@ interface VideoRow {
 
 const USAGE = `Usage:
   loomy publish <file> [--title <title>]   Publish a recording and print its link.
-  loomy publish <id>                       Publish an evicted video again from the local copy.
+  loomy publish <id>                       Publish an evicted video again. Uses the local copy, or the archive.
+  loomy import <loom-link>...              Download videos from Loom share links and publish them. Needs yt-dlp.
+  loomy archive [<id>]                     Copy one video, or all videos, to the archive.
   loomy list [--json]                      List all videos.
   loomy rm <id>                            Remove a video from the watch service.
 
 Configuration:
   Set LOOMY_URL and LOOMY_ADMIN_TOKEN, or write them to ${configPath()}
-  as {"url": "...", "adminToken": "..."}.
+  as {"url": "...", "adminToken": "...", "archive": "user@host:directory"}.
+  LOOMY_ARCHIVE sets the archive. The archive is optional.
 `;
 
 function configPath(): string {
@@ -66,7 +80,8 @@ async function loadConfig(): Promise<Config> {
   if (!url || !adminToken) {
     throw new Error(`The configuration is not complete.\n\n${USAGE}`);
   }
-  return { url, adminToken };
+  const archive = (process.env.LOOMY_ARCHIVE ?? file.archive ?? "").replace(/\/+$/, "") || undefined;
+  return { url, adminToken, archive };
 }
 
 const ATTEMPTS = 4;
@@ -163,6 +178,53 @@ async function uploadFile(config: Config, id: string, name: string, file: string
   }
 }
 
+const MEDIA_FILES = ["video.mp4", "thumb.jpg", "captions.vtt"];
+
+function rsync(args: string[]): Promise<unknown> {
+  // BatchMode makes ssh fail when it needs a password. It does not stop for input.
+  return run("rsync", ["-a", "-e", "ssh -o BatchMode=yes -o ConnectTimeout=10", ...args]);
+}
+
+// The archive gets the files of the watch service and the original recording.
+async function archiveVideo(archive: string, id: string): Promise<void> {
+  const dir = join(dataDir(), id);
+  const meta = JSON.parse(await readFile(join(dir, "meta.json"), "utf8")) as Meta;
+  const target = `${archive}/${id}/`;
+  await rsync([`${dir}/`, target]);
+  if (existsSync(meta.source)) {
+    await rsync([meta.source, `${target}original${extname(meta.source).toLowerCase()}`]);
+  }
+}
+
+async function restoreVideo(archive: string, id: string): Promise<void> {
+  const dir = join(dataDir(), id);
+  await mkdir(dir, { recursive: true });
+  await rsync(["--exclude", "original.*", `${archive}/${id}/`, `${dir}/`]);
+}
+
+async function archiveCommand(id: string | undefined): Promise<void> {
+  const config = await loadConfig();
+  if (!config.archive) throw new Error("The configuration has no archive.");
+  if (id !== undefined && !ID_RE.test(id)) throw new Error("The ID is not valid.");
+  const ids = id ? [id] : (await readdir(dataDir())).filter((name) => ID_RE.test(name));
+  let failures = 0;
+  for (const each of ids) {
+    try {
+      await archiveVideo(config.archive, each);
+      log(`Archived ${each}.`);
+    } catch (err) {
+      failures++;
+      log(`The archive copy of ${each} failed: ${errorText(err)}`);
+    }
+  }
+  if (failures > 0) throw new Error(`${failures} of ${ids.length} videos are not in the archive.`);
+}
+
+function errorText(err: unknown): string {
+  const stderr = err && typeof err === "object" && "stderr" in err ? String(err.stderr).trim() : "";
+  return stderr || (err instanceof Error ? err.message : String(err));
+}
+
 function copyToClipboard(value: string): void {
   if (process.platform !== "darwin" || process.env.LOOMY_NO_CLIPBOARD) return;
   const child = spawn("pbcopy", { stdio: ["pipe", "ignore", "ignore"] });
@@ -170,14 +232,21 @@ function copyToClipboard(value: string): void {
   child.stdin.end(value);
 }
 
-async function publish(target: string, titleOption: string | undefined): Promise<void> {
+async function publish(target: string, options: PublishOptions = {}): Promise<void> {
+  const titleOption = options.title;
   const config = await loadConfig();
   let meta: Meta;
   let dir: string;
 
-  if (ID_RE.test(target) && existsSync(join(dataDir(), target, "meta.json"))) {
-    // Publish a video again from the local copy.
+  const isLocalFile = existsSync(resolve(target));
+  if (ID_RE.test(target) && !isLocalFile) {
+    // Publish a video again from the local copy, or from the archive.
     dir = join(dataDir(), target);
+    if (!existsSync(join(dir, "video.mp4"))) {
+      if (!config.archive) throw new Error(`No local copy of ${target} exists, and the configuration has no archive.`);
+      log("Get the video from the archive.");
+      await restoreVideo(config.archive, target);
+    }
     meta = JSON.parse(await readFile(join(dir, "meta.json"), "utf8")) as Meta;
     if (titleOption) meta.title = titleOption;
     log(`Publish "${meta.title}" again.`);
@@ -192,7 +261,8 @@ async function publish(target: string, titleOption: string | undefined): Promise
       title: titleOption ?? basename(source, extname(source)),
       source,
       durationS: await probeDuration(source),
-      createdAt: new Date().toISOString(),
+      createdAt: options.createdAt ?? new Date().toISOString(),
+      ...(options.importedFrom ? { importedFrom: options.importedFrom } : {}),
     };
     log("Transcode the recording.");
     await transcode(source, join(dir, "video.mp4"));
@@ -202,8 +272,14 @@ async function publish(target: string, titleOption: string | undefined): Promise
 
   log("Upload the video.");
   const path = `/admin/videos/${meta.id}`;
-  await api(config, "PUT", path, JSON.stringify({ title: meta.title, durationS: meta.durationS }), true);
-  for (const name of ["video.mp4", "thumb.jpg", "captions.vtt"]) {
+  await api(
+    config,
+    "PUT",
+    path,
+    JSON.stringify({ title: meta.title, durationS: meta.durationS, createdAt: Date.parse(meta.createdAt) || undefined }),
+    true,
+  );
+  for (const name of MEDIA_FILES) {
     const file = join(dir, name);
     if (existsSync(file)) await uploadFile(config, meta.id, name, file);
   }
@@ -211,6 +287,74 @@ async function publish(target: string, titleOption: string | undefined): Promise
 
   copyToClipboard(result.url);
   process.stdout.write(`${result.url}\n`);
+
+  if (!config.archive) {
+    log("The configuration has no archive. The Mac has the only copy.");
+    return;
+  }
+  try {
+    await archiveVideo(config.archive, meta.id);
+    log("The video is in the archive.");
+  } catch (err) {
+    // The link works, so this is not a failure of the publish. Exit code 2 reports it.
+    log(`The archive copy failed: ${errorText(err)}\nRun "loomy archive ${meta.id}" to try again.`);
+    process.exitCode = 2;
+  }
+}
+
+// Returns the ID of the local video that came from this link, if one exists.
+async function findImport(link: string): Promise<string | undefined> {
+  if (!existsSync(dataDir())) return undefined;
+  for (const id of await readdir(dataDir())) {
+    const file = join(dataDir(), id, "meta.json");
+    if (!ID_RE.test(id) || !existsSync(file)) continue;
+    if ((JSON.parse(await readFile(file, "utf8")) as Meta).importedFrom === link) return id;
+  }
+  return undefined;
+}
+
+async function importLoom(links: string[]): Promise<void> {
+  for (const link of links) {
+    if (!LOOM_RE.test(link)) throw new Error(`This is not a Loom share link: ${link}`);
+  }
+  let failures = 0;
+  for (const raw of links) {
+    const link = raw.split("?")[0]!;
+    const existing = await findImport(link);
+    if (existing) {
+      log(`${link} is already imported as ${existing}. Skipped.`);
+      continue;
+    }
+    const temp = await mkdtemp(join(tmpdir(), "loomy-import-"));
+    process.exitCode = 0;
+    try {
+      log(`Download ${link}.`);
+      const common = ["--no-warnings", "--no-playlist", "--ignore-config"];
+      const { stdout } = await run("yt-dlp", [...common, "--skip-download", "--dump-json", "--", link], {
+        maxBuffer: 64 * 1024 * 1024,
+      });
+      const info = JSON.parse(stdout) as { title?: string; timestamp?: number };
+      const file = join(temp, "loom.mp4");
+      await run("yt-dlp", [...common, "--quiet", "--merge-output-format", "mp4", "-o", file, "--", link], {
+        maxBuffer: 64 * 1024 * 1024,
+      });
+      await publish(file, {
+        title: info.title?.trim() || "Loom video",
+        createdAt: info.timestamp ? new Date(info.timestamp * 1000).toISOString() : undefined,
+        importedFrom: link,
+      });
+    } catch (err) {
+      failures++;
+      log(`The import of ${link} failed: ${errorText(err)}`);
+      continue;
+    } finally {
+      // After a failed archive copy, the download stays, because "loomy archive" needs it.
+      if (process.exitCode !== 2) await rm(temp, { recursive: true, force: true });
+      else failures++;
+    }
+  }
+  process.exitCode = 0;
+  if (failures > 0) throw new Error(`${failures} of ${links.length} imports have a problem.`);
 }
 
 async function list(asJson: boolean): Promise<void> {
@@ -250,7 +394,9 @@ async function main(): Promise<void> {
     process.stdout.write(USAGE);
     return;
   }
-  if (command === "publish" && argument) return publish(argument, values.title);
+  if (command === "publish" && argument) return publish(argument, { title: values.title });
+  if (command === "import" && argument) return importLoom(positionals.slice(1));
+  if (command === "archive") return archiveCommand(argument);
   if (command === "list") return list(values.json);
   if (command === "rm" && argument) return remove(argument);
   throw new Error(`The command is not valid.\n\n${USAGE}`);
