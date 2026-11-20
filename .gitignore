@@ -36,3 +36,6 @@ worker/wrangler.jsonc
 
 # Browser test output
 .playwright-mcp/
+
+# Swift build output
+.build/
