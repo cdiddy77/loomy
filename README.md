@@ -8,6 +8,6 @@ All documentation is in Notion: <https://app.notion.com/p/Loomy-418c224faa6e80af
 
 ## Status
 
-The watch service (`worker/`) and the publish tool (`cli/`) pass a local test. The Worker is deployed.
+The watch service (`worker/`), the publish tool (`cli/`), and the transcriber (`transcriber/`) pass a local test. The Worker is deployed.
 
 Run `pnpm install`, then `pnpm e2e`, to do the local test.

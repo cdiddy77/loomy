@@ -160,6 +160,44 @@ set -e
 [ "$(cat "$WORK/out.txt")" = "$URL_A" ] || fail "a failed archive copy must not stop the publish"
 pass "a failed archive copy gives a warning and exit code 2"
 
+# --- Transcript --------------------------------------------------------------
+# The fake transcribe command keeps the audio that it gets, and writes a fixed transcript.
+cat >"$WORK/fake-transcribe.sh" <<FAKE
+cat >"$WORK/heard.aac"
+printf 'WEBVTT\n\n00:00.000 --> 00:01.000\nFake words\n'
+FAKE
+FAKE_TRANSCRIBE="sh $WORK/fake-transcribe.sh"
+
+LOOMY_TRANSCRIBE="$FAKE_TRANSCRIBE" $LOOMY transcribe "$ID_A" 2>/dev/null
+[ "$(ffprobe -v error -select_streams a -show_entries stream=codec_name -of csv=p=0 "$WORK/heard.aac")" = "aac" ] \
+  || fail "the transcribe command did not get the audio"
+curl -s "$URL_A/captions.vtt" | grep -q "Fake words" || fail "transcribe did not upload the captions"
+curl -s "$URL_A" | grep -q '<track kind="captions"' || fail "the watch page has no captions track after transcribe"
+[ -f "$LOOMY_ARCHIVE/$ID_A/captions.vtt" ] || fail "transcribe did not copy the captions to the archive"
+pass "transcribe adds the captions to a published video and to the archive"
+
+URL_C="$(LOOMY_TRANSCRIBE="$FAKE_TRANSCRIBE" $LOOMY publish "$WORK/small.mov" --title C 2>/dev/null)"
+[ "$(status "$URL_C/captions.vtt")" = "200" ] || fail "publish did not make the transcript"
+pass "publish makes the transcript"
+
+URL_D="$(LOOMY_TRANSCRIBE="$FAKE_TRANSCRIBE" $LOOMY publish "$WORK/small.mov" --title D --no-transcript 2>/dev/null)"
+[ "$(status "$URL_D/captions.vtt")" = "404" ] || fail "--no-transcript made a transcript"
+pass "--no-transcript skips the transcript"
+
+set +e
+URL_E="$(LOOMY_TRANSCRIBE="echo broken >&2; exit 3" $LOOMY publish "$WORK/small.mov" --title E 2>"$WORK/err.txt")"
+CODE=$?
+set -e
+[ "$CODE" = "2" ] || fail "a failed transcript must give exit code 2, not $CODE"
+[ "$(status "$URL_E")" = "200" ] || fail "a failed transcript must not stop the publish"
+grep -q "broken" "$WORK/err.txt" || fail "the warning does not show the error of the transcribe command"
+pass "a failed transcript gives a warning and exit code 2"
+
+LOOMY_TRANSCRIBE="$FAKE_TRANSCRIBE" $LOOMY transcribe 2>/dev/null
+[ "$(status "$URL_D/captions.vtt")" = "200" ] || fail "transcribe without an ID skipped video D"
+[ "$(status "$URL_E/captions.vtt")" = "200" ] || fail "transcribe without an ID skipped video E"
+pass "transcribe without an ID adds the missing transcripts"
+
 # --- Time of creation --------------------------------------------------------
 curl -s -o /dev/null -X PUT -H "Authorization: Bearer $LOOMY_ADMIN_TOKEN" -H 'Content-Type: application/json' \
   --data '{"title":"Old","durationS":1,"createdAt":1500000000000}' "$LOOMY_URL/admin/videos/BBBBBBBBBBBBBBBBBBBBBB"

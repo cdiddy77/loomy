@@ -19,6 +19,8 @@ interface Config {
   adminToken: string;
   // The rsync destination of the archive: "user@host:directory" or a local directory.
   archive?: string;
+  // A shell command that reads audio on stdin and writes WebVTT captions on stdout.
+  transcribe?: string;
 }
 
 interface Meta {
@@ -33,6 +35,7 @@ interface Meta {
 
 interface PublishOptions {
   title?: string;
+  transcript?: boolean;
   createdAt?: string;
   importedFrom?: string;
 }
@@ -52,14 +55,17 @@ const USAGE = `Usage:
   loomy publish <file> [--title <title>]   Publish a recording and print its link.
   loomy publish <id>                       Publish an evicted video again. Uses the local copy, or the archive.
   loomy import <loom-link>...              Download videos from Loom share links and publish them. Needs yt-dlp.
+  loomy transcribe [<id>] [--force]        Make the transcript of one video, or of all videos with no transcript.
   loomy archive [<id>]                     Copy one video, or all videos, to the archive.
   loomy list [--json]                      List all videos.
   loomy rm <id>                            Remove a video from the watch service.
 
 Configuration:
   Set LOOMY_URL and LOOMY_ADMIN_TOKEN, or write them to ${configPath()}
-  as {"url": "...", "adminToken": "...", "archive": "user@host:directory"}.
-  LOOMY_ARCHIVE sets the archive. The archive is optional.
+  as {"url": "...", "adminToken": "...", "archive": "user@host:directory", "transcribe": "command"}.
+  LOOMY_ARCHIVE sets the archive. LOOMY_TRANSCRIBE sets the transcribe command. Both are optional.
+  The transcribe command reads audio on stdin and writes WebVTT on stdout.
+  Use --no-transcript with publish or import to skip the transcript.
 `;
 
 function configPath(): string {
@@ -81,7 +87,8 @@ async function loadConfig(): Promise<Config> {
     throw new Error(`The configuration is not complete.\n\n${USAGE}`);
   }
   const archive = (process.env.LOOMY_ARCHIVE ?? file.archive ?? "").replace(/\/+$/, "") || undefined;
-  return { url, adminToken, archive };
+  const transcribe = (process.env.LOOMY_TRANSCRIBE ?? file.transcribe ?? "").trim() || undefined;
+  return { url, adminToken, archive, transcribe };
 }
 
 const ATTEMPTS = 4;
@@ -288,6 +295,20 @@ async function publish(target: string, options: PublishOptions = {}): Promise<vo
   copyToClipboard(result.url);
   process.stdout.write(`${result.url}\n`);
 
+  // The link works before the transcript exists. The transcript comes after it.
+  if (config.transcribe && options.transcript !== false && !existsSync(join(dir, "captions.vtt"))) {
+    try {
+      if (await makeTranscript(config.transcribe, dir)) {
+        await uploadFile(config, meta.id, "captions.vtt", join(dir, "captions.vtt"));
+        await api(config, "POST", `${path}/ready`);
+        log("The transcript is on the watch page.");
+      }
+    } catch (err) {
+      log(`The transcript failed: ${errorText(err)}\nRun "loomy transcribe ${meta.id}" to try again.`);
+      process.exitCode = 2;
+    }
+  }
+
   if (!config.archive) {
     log("The configuration has no archive. The Mac has the only copy.");
     return;
@@ -302,6 +323,106 @@ async function publish(target: string, options: PublishOptions = {}): Promise<vo
   }
 }
 
+async function hasAudio(file: string): Promise<boolean> {
+  const { stdout } = await run("ffprobe", [
+    "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", file,
+  ]);
+  return stdout.trim().length > 0;
+}
+
+// Sends the audio of video.mp4 to the transcribe command and writes captions.vtt.
+// Returns false when the video has no audio.
+async function makeTranscript(command: string, dir: string): Promise<boolean> {
+  const video = join(dir, "video.mp4");
+  if (!(await hasAudio(video))) {
+    log("The video has no audio, so it gets no transcript.");
+    return false;
+  }
+  log("Make the transcript.");
+  const temp = await mkdtemp(join(tmpdir(), "loomy-audio-"));
+  try {
+    // video.mp4 always has AAC audio, so a copy of the stream is sufficient.
+    const audio = join(temp, "audio.aac");
+    await run("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-i", video, "-vn", "-c:a", "copy", "-f", "adts", audio]);
+    const input = await open(audio, "r");
+    let output: string;
+    try {
+      output = await new Promise<string>((done, fail) => {
+        const child = spawn("/bin/sh", ["-c", command], { stdio: [input.fd, "pipe", "pipe"] });
+        const out: Buffer[] = [];
+        const err: Buffer[] = [];
+        child.stdout!.on("data", (chunk: Buffer) => out.push(chunk));
+        child.stderr!.on("data", (chunk: Buffer) => err.push(chunk));
+        child.on("error", fail);
+        child.on("close", (code) => {
+          const stderr = Buffer.concat(err).toString().trim();
+          if (code === 0) done(Buffer.concat(out).toString());
+          else fail(new Error(`The transcribe command stopped with code ${code}.${stderr ? `\n${stderr}` : ""}`));
+        });
+      });
+    } finally {
+      await input.close();
+    }
+    if (!output.startsWith("WEBVTT")) throw new Error("The transcribe command did not write WebVTT.");
+    await writeFile(join(dir, "captions.vtt"), output);
+    return true;
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+}
+
+async function transcribeCommand(id: string | undefined, force: boolean): Promise<void> {
+  const config = await loadConfig();
+  if (!config.transcribe) throw new Error("The configuration has no transcribe command.");
+  if (id !== undefined && !ID_RE.test(id)) throw new Error("The ID is not valid.");
+  let ids: string[];
+  if (id) {
+    ids = [id];
+    if (!existsSync(join(dataDir(), id, "video.mp4"))) {
+      if (!config.archive) throw new Error(`No local copy of ${id} exists, and the configuration has no archive.`);
+      log("Get the video from the archive.");
+      await restoreVideo(config.archive, id);
+    }
+  } else {
+    const names = existsSync(dataDir()) ? await readdir(dataDir()) : [];
+    ids = names.filter(
+      (name) =>
+        ID_RE.test(name) &&
+        existsSync(join(dataDir(), name, "video.mp4")) &&
+        (force || !existsSync(join(dataDir(), name, "captions.vtt"))),
+    );
+  }
+  if (ids.length === 0) {
+    log("All local videos have a transcript.");
+    return;
+  }
+  const { videos } = (await api(config, "GET", "/admin/videos")) as { videos: VideoRow[] };
+  const states = new Map(videos.map((video) => [video.id, video.state]));
+  let failures = 0;
+  for (const each of ids) {
+    const dir = join(dataDir(), each);
+    try {
+      if (!force && existsSync(join(dir, "captions.vtt"))) {
+        log(`${each} already has a transcript. Use --force to make it again.`);
+        continue;
+      }
+      log(`Transcribe ${each}.`);
+      if (!(await makeTranscript(config.transcribe, dir))) continue;
+      // An evicted video gets the transcript when it is published again.
+      if (states.get(each) === "ready") {
+        await uploadFile(config, each, "captions.vtt", join(dir, "captions.vtt"));
+        await api(config, "POST", `/admin/videos/${each}/ready`);
+        log("The transcript is on the watch page.");
+      }
+      if (config.archive) await archiveVideo(config.archive, each);
+    } catch (err) {
+      failures++;
+      log(`The transcript of ${each} failed: ${errorText(err)}`);
+    }
+  }
+  if (failures > 0) throw new Error(`${failures} of ${ids.length} transcripts failed.`);
+}
+
 // Returns the ID of the local video that came from this link, if one exists.
 async function findImport(link: string): Promise<string | undefined> {
   if (!existsSync(dataDir())) return undefined;
@@ -313,7 +434,7 @@ async function findImport(link: string): Promise<string | undefined> {
   return undefined;
 }
 
-async function importLoom(links: string[]): Promise<void> {
+async function importLoom(links: string[], transcript: boolean): Promise<void> {
   for (const link of links) {
     if (!LOOM_RE.test(link)) throw new Error(`This is not a Loom share link: ${link}`);
   }
@@ -342,6 +463,7 @@ async function importLoom(links: string[]): Promise<void> {
         title: info.title?.trim() || "Loom video",
         createdAt: info.timestamp ? new Date(info.timestamp * 1000).toISOString() : undefined,
         importedFrom: link,
+        transcript,
       });
     } catch (err) {
       failures++;
@@ -386,6 +508,8 @@ async function main(): Promise<void> {
     options: {
       title: { type: "string" },
       json: { type: "boolean", default: false },
+      force: { type: "boolean", default: false },
+      "no-transcript": { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
   });
@@ -394,8 +518,9 @@ async function main(): Promise<void> {
     process.stdout.write(USAGE);
     return;
   }
-  if (command === "publish" && argument) return publish(argument, { title: values.title });
-  if (command === "import" && argument) return importLoom(positionals.slice(1));
+  if (command === "publish" && argument) return publish(argument, { title: values.title, transcript: !values["no-transcript"] });
+  if (command === "import" && argument) return importLoom(positionals.slice(1), !values["no-transcript"]);
+  if (command === "transcribe") return transcribeCommand(argument, values.force);
   if (command === "archive") return archiveCommand(argument);
   if (command === "list") return list(values.json);
   if (command === "rm" && argument) return remove(argument);
